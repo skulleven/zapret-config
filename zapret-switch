@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Constants and Directories ---
+ZAPRET_DIR="/opt/zapret"
+CONFIG_PATH="${ZAPRET_DIR}/config"
+HOSTLIST_DIR="${ZAPRET_DIR}/ipset"
+HOSTLIST_PATH="${HOSTLIST_DIR}/zapret-hosts-user.txt"
+
+PROFILE_DIR="${ZAPRET_DIR}/profiles"
+SKULLEVEN_CONF="${PROFILE_DIR}/skulleven.conf"
+KUTUPHANE_CONF="${PROFILE_DIR}/kutuphane.conf"
+PROFILE_HOSTS="${PROFILE_DIR}/zapret-hosts-user.txt"
+KUTUPHANE_HOSTS="${PROFILE_DIR}/zapret-hosts-kutuphane.txt"
+BACKUP_CONF="${PROFILE_DIR}/original.conf.bak"
+BACKUP_HOSTS="${PROFILE_DIR}/original.hosts.bak"
+ACTIVE_FILE="${PROFILE_DIR}/active"
+
+# Repository directory where the script resides (resolving symlinks)
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+LOCAL_SKULLEVEN_CONF="${SCRIPT_DIR}/config"
+LOCAL_KUTUPHANE_CONF="${SCRIPT_DIR}/kutuphane.conf"
+LOCAL_HOSTS="${SCRIPT_DIR}/zapret-hosts-user.txt"
+
+REPO_BASE_MAIN="https://raw.githubusercontent.com/skulleven/zapret-config/main"
+REPO_BASE_MASTER="https://raw.githubusercontent.com/skulleven/zapret-config/master"
+
+# Extra Steam/Valve domains appended to zapret-hosts-user.txt when kutuphane profile is active
+KUTUPHANE_EXTRA_HOSTS=(
+    "steampowered.com"
+    "steamcommunity.com"
+    "steamstatic.com"
+    "steamcontent.com"
+    "steamusercontent.com"
+    "steamgames.com"
+    "steam-chat.com"
+    "steamserver.net"
+    "s.team"
+    "valvesoftware.com"
+    "valve.net"
+    "steamcdn-a.akamaihd.net"
+    "steamstore-a.akamaihd.net"
+    "steamuserimages-a.akamaihd.net"
+)
+
+# --- Helper Functions ---
+log_info() { echo "[INFO] $*"; }
+log_err()  { echo "[ERROR] $*" >&2; }
+
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        log_err "This operation requires root privileges. Example: sudo $(basename "$0") ${1:-skulleven}"
+        exit 1
+    fi
+}
+
+# Gets required files from GitHub Raw, falling back to local files if not available.
+download_file() {
+    local filename="$1"
+    local dest="$2"
+    local tmp_file
+    tmp_file="$(mktemp)"
+
+    if curl -fsSL "${REPO_BASE_MAIN}/${filename}" -o "${tmp_file}" 2>/dev/null; then
+        mv "${tmp_file}" "${dest}"
+        log_info "Downloaded '${filename}' from GitHub (main)."
+        return 0
+    elif curl -fsSL "${REPO_BASE_MASTER}/${filename}" -o "${tmp_file}" 2>/dev/null; then
+        mv "${tmp_file}" "${dest}"
+        log_info "Downloaded '${filename}' from GitHub (master)."
+        return 0
+    else
+        rm -f "${tmp_file}"
+        return 1
+    fi
+}
+
+sync_single_file() {
+    local remote_name="$1"
+    local local_path="$2"
+    local dest_path="$3"
+    local force_remote="$4"
+    local required="${5:-true}"
+
+    # 1. Use local file if available and remote download is not forced
+    if [[ "${force_remote}" == "false" && -f "${local_path}" ]]; then
+        cp "${local_path}" "${dest_path}"
+        log_info "Copied local '${remote_name}' to profile (${local_path})."
+        return 0
+    fi
+
+    # 2. Download from GitHub Raw, fallback to local file on failure
+    if ! download_file "${remote_name}" "${dest_path}"; then
+        if [[ -f "${local_path}" ]]; then
+            log_info "Failed to download '${remote_name}' from GitHub, falling back to local file (${local_path})."
+            cp "${local_path}" "${dest_path}"
+        elif [[ "${required}" == "true" ]]; then
+            log_err "Failed to download '${remote_name}' from GitHub and no local file found (${local_path})."
+            exit 1
+        fi
+    fi
+}
+
+# Prepares the Kütüphane profile hosts file by combining the user-defined hosts and the extra Steam domains, ensuring no duplicates.
+build_kutuphane_hosts() {
+    local tmp_hosts
+    tmp_hosts="$(mktemp)"
+
+    if [[ -f "${PROFILE_HOSTS}" ]]; then
+        cat "${PROFILE_HOSTS}" > "${tmp_hosts}"
+        echo "" >> "${tmp_hosts}"
+    fi
+
+    printf "%s\n" "${KUTUPHANE_EXTRA_HOSTS[@]}" >> "${tmp_hosts}"
+    awk 'NF && !seen[$0]++' "${tmp_hosts}" > "${KUTUPHANE_HOSTS}"
+    rm -f "${tmp_hosts}"
+}
+
+sync_repo_files() {
+    local force_remote="${1:-false}"
+    mkdir -p "${PROFILE_DIR}" "${HOSTLIST_DIR}"
+
+    # Try git pull first if remote update is requested and directory is a git repo
+    if [[ "${force_remote}" == "true" && -d "${SCRIPT_DIR}/.git" ]]; then
+        log_info "Updating local git repository..."
+        if git -C "${SCRIPT_DIR}" pull --ff-only 2>/dev/null; then
+            log_info "Git repository updated."
+            force_remote="false"
+        fi
+    fi
+
+    sync_single_file "config" "${LOCAL_SKULLEVEN_CONF}" "${SKULLEVEN_CONF}" "${force_remote}" "true"
+    sync_single_file "kutuphane.conf" "${LOCAL_KUTUPHANE_CONF}" "${KUTUPHANE_CONF}" "${force_remote}" "true"
+    sync_single_file "zapret-hosts-user.txt" "${LOCAL_HOSTS}" "${PROFILE_HOSTS}" "${force_remote}" "false"
+    build_kutuphane_hosts
+}
+
+init_profiles() {
+    mkdir -p "${PROFILE_DIR}" "${HOSTLIST_DIR}"
+
+    if [[ -f "${CONFIG_PATH}" && ! -f "${BACKUP_CONF}" ]]; then
+        cp "${CONFIG_PATH}" "${BACKUP_CONF}"
+    fi
+
+    if [[ -f "${HOSTLIST_PATH}" && ! -f "${BACKUP_HOSTS}" ]]; then
+        cp "${HOSTLIST_PATH}" "${BACKUP_HOSTS}"
+    fi
+}
+
+# Cleans up temporary rules so we dont cause a resonance cascade (kills the internet)
+cleanup_temp_rules() {
+    nft delete table inet steam_dpi 2>/dev/null || true
+    nft delete table inet zapret 2>/dev/null || true
+    pkill -9 tpws 2>/dev/null || true
+    pkill -9 nfqws 2>/dev/null || true
+}
+
+apply_profile() {
+    local target_conf="$1"
+    local profile_name="$2"
+    local target_hosts="${3:-}"
+
+    if [[ ! -f "${target_conf}" ]]; then
+        log_err "Profile file not found: ${target_conf}"
+        exit 1
+    fi
+
+    systemctl stop zapret 2>/dev/null || true
+    cleanup_temp_rules
+
+    cp "${target_conf}" "${CONFIG_PATH}"
+
+    if [[ -n "${target_hosts}" && -f "${target_hosts}" ]]; then
+        mkdir -p "${HOSTLIST_DIR}"
+        cp "${target_hosts}" "${HOSTLIST_PATH}"
+        log_info "Hostlist updated: ${HOSTLIST_PATH} ($(wc -l < "${HOSTLIST_PATH}") domains)"
+    fi
+
+    echo "${profile_name}" > "${ACTIVE_FILE}"
+    systemctl start zapret
+
+    log_info "Active profile: ${profile_name}"
+    systemctl --no-pager -l status zapret | head -n 5 || true
+}
+
+show_status() {
+    local active="unknown"
+    if [[ -f "${ACTIVE_FILE}" ]]; then
+        active="$(cat "${ACTIVE_FILE}")"
+    fi
+
+    local srv_status
+    srv_status="$(systemctl is-active zapret 2>/dev/null || true)"
+
+    echo "Active profile : ${active}"
+    echo "Service status : ${srv_status:-inactive}"
+    echo "Config path    : ${CONFIG_PATH}"
+    if [[ -f "${HOSTLIST_PATH}" ]]; then
+        echo "Hostlist       : ${HOSTLIST_PATH} ($(wc -l < "${HOSTLIST_PATH}") domains)"
+    else
+        echo "Hostlist       : Not found (${HOSTLIST_PATH})"
+    fi
+}
+
+install_self() {
+    local target_bin="/usr/local/bin/zapret-switch"
+    ln -sf "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")" "${target_bin}"
+    chmod +x "${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+    log_info "Symlink created: ${target_bin} -> ${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
+}
+
+usage() {
+    cat << 'EOF'
+Usage: sudo zapret-switch <command>
+
+Commands:
+  skulleven   Switch to skulleven/zapret-config (config) profile
+  kutuphane   Switch to Library Wi-Fi (kutuphane.conf + Steam domains) profile
+  update      Update all profile and hostlist files from repo / GitHub
+  restore     Restore original backed-up zapret configuration
+  install     Symlink this script to /usr/local/bin/zapret-switch
+  status      Show active profile, hostlist, and zapret service status
+  off         Stop zapret service and clean up temporary firewall rules
+EOF
+}
+
+main() {
+    local cmd="${1:-}"
+
+    case "${cmd}" in
+        skulleven)
+            require_root "${cmd}"
+            init_profiles
+            sync_repo_files "false"
+            apply_profile "${SKULLEVEN_CONF}" "skulleven" "${PROFILE_HOSTS}"
+            ;;
+        kutuphane)
+            require_root "${cmd}"
+            init_profiles
+            sync_repo_files "false"
+            apply_profile "${KUTUPHANE_CONF}" "kutuphane" "${KUTUPHANE_HOSTS}"
+            ;;
+        update)
+            require_root "${cmd}"
+            init_profiles
+            sync_repo_files "true"
+            if [[ -f "${ACTIVE_FILE}" ]]; then
+                local current_active
+                current_active="$(cat "${ACTIVE_FILE}")"
+                if [[ "${current_active}" == "skulleven" ]]; then
+                    log_info "Re-applying active profile 'skulleven'..."
+                    apply_profile "${SKULLEVEN_CONF}" "skulleven" "${PROFILE_HOSTS}"
+                elif [[ "${current_active}" == "kutuphane" ]]; then
+                    log_info "Re-applying active profile 'kutuphane'..."
+                    apply_profile "${KUTUPHANE_CONF}" "kutuphane" "${KUTUPHANE_HOSTS}"
+                fi
+            fi
+            ;;
+        restore)
+            require_root "${cmd}"
+            if [[ ! -f "${BACKUP_CONF}" ]]; then
+                log_err "Backup config not found: ${BACKUP_CONF}"
+                exit 1
+            fi
+            apply_profile "${BACKUP_CONF}" "original" "${BACKUP_HOSTS}"
+            ;;
+        install)
+            require_root "${cmd}"
+            install_self
+            ;;
+        status)
+            show_status
+            ;;
+        off)
+            require_root "${cmd}"
+            mkdir -p "${PROFILE_DIR}"
+            systemctl stop zapret 2>/dev/null || true
+            cleanup_temp_rules
+            echo "off" > "${ACTIVE_FILE}"
+            log_info "Zapret stopped."
+            ;;
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
